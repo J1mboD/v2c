@@ -1,6 +1,9 @@
+import hmac
 import html
 import math
+import os
 import sqlite3
+import time
 import uuid
 from collections import Counter
 from contextlib import closing
@@ -221,6 +224,62 @@ def photos_for_locations(ids):
     return out
 
 
+def _remove_image(filename):
+    (IMG_DIR / Path(filename).name).unlink(missing_ok=True)
+
+
+def delete_photo(photo_id):
+    """Remove one photo (database row and image file). Admin use only."""
+    with closing(db()) as conn, conn:
+        row = conn.execute("SELECT filename FROM photos WHERE id = ?", (photo_id,)).fetchone()
+        if not row:
+            return False
+        conn.execute("DELETE FROM photos WHERE id = ?", (photo_id,))
+    _remove_image(row["filename"])
+    return True
+
+
+def delete_location(location_id):
+    """Remove a location and all of its photos. Admin use only."""
+    with closing(db()) as conn, conn:
+        files = [r["filename"] for r in
+                 conn.execute("SELECT filename FROM photos WHERE location_id = ?", (location_id,))]
+        conn.execute("DELETE FROM photos WHERE location_id = ?", (location_id,))
+        conn.execute("DELETE FROM locations WHERE id = ?", (location_id,))
+    for f in files:
+        _remove_image(f)
+    return len(files)
+
+
+def admin_photos(location_id=None, limit=30):
+    sql = ("SELECT p.*, l.name FROM photos p JOIN locations l ON l.id = p.location_id")
+    params = []
+    if location_id:
+        sql += " WHERE p.location_id = ?"
+        params.append(location_id)
+    sql += " ORDER BY p.created_at DESC LIMIT ?"
+    params.append(limit)
+    with closing(db()) as conn:
+        return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+
+def location_counts():
+    with closing(db()) as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT l.id, l.name, COUNT(p.id) AS n FROM locations l "
+            "LEFT JOIN photos p ON p.location_id = l.id GROUP BY l.id ORDER BY l.name")]
+
+
+def admin_password():
+    """Read the admin password from Streamlit secrets or an environment variable."""
+    pw = None
+    try:
+        pw = st.secrets.get("ADMIN_PASSWORD")
+    except Exception:
+        pass
+    return pw or os.environ.get("PHOTOSPOTS_ADMIN_PASSWORD") or None
+
+
 # ---------- Summaries ----------
 def fmt_counts(counter):
     return ", ".join(f"{k} ×{v}" for k, v in counter.most_common())
@@ -429,11 +488,20 @@ ss.setdefault("form_nonce", 0)
 ss.setdefault("exif_ident", None)
 ss.setdefault("exif_note", None)
 ss.setdefault("last_geo", None)
+ss.setdefault("is_admin", False)
+ss.setdefault("admin_fails", 0)
+ss.setdefault("admin_locked_until", 0.0)
+ss.setdefault("admin_nonce", 0)
 
 st.title("📷 PhotoSpots")
 st.caption("Find photography locations by the conditions you want to shoot in.")
 
-tab_search, tab_submit, tab_map = st.tabs(["🔍 Search", "➕ Submit a photo", "🗺️ Map"])
+# The admin tab is not rendered for normal visitors. Open the app with ?admin in the URL to reveal it.
+admin_visible = ("admin" in st.query_params) or ss.is_admin
+_labels = ["🔍 Search", "➕ Submit a photo", "🗺️ Map"] + (["🔧 Admin"] if admin_visible else [])
+_tabs = st.tabs(_labels)
+tab_search, tab_submit, tab_map = _tabs[:3]
+tab_admin = _tabs[3] if admin_visible else None
 
 # ----- Search -----
 with tab_search:
@@ -701,3 +769,84 @@ with tab_map:
         lons = [l["longitude"] for l in locs]
         m.fit_bounds([[min(lats), min(lons)], [max(lats), max(lons)]], max_zoom=12)
         st_folium(m, key="overview", height=550, use_container_width=True, returned_objects=[])
+
+# ----- Admin (hidden) -----
+if tab_admin is not None:
+    with tab_admin:
+        st.subheader("Admin")
+        expected = admin_password()
+        if not expected:
+            st.warning("Admin access isn't configured. Set ADMIN_PASSWORD in "
+                       ".streamlit/secrets.toml (or the PHOTOSPOTS_ADMIN_PASSWORD environment variable).")
+        elif not ss.is_admin:
+            locked = time.time() < ss.admin_locked_until
+            pw = st.text_input("Admin password", type="password", key="admin_pw")
+            if st.button("Log in", disabled=locked):
+                if hmac.compare_digest(pw.encode(), expected.encode()):
+                    ss.is_admin = True
+                    ss.admin_fails = 0
+                    st.rerun()
+                else:
+                    ss.admin_fails += 1
+                    time.sleep(1)  # slow down guessing
+                    if ss.admin_fails >= 5:
+                        ss.admin_locked_until = time.time() + 60
+                        ss.admin_fails = 0
+                    st.error("Incorrect password.")
+            if locked:
+                st.warning("Too many attempts. Please wait a minute and try again.")
+        else:
+            c1, c2 = st.columns([4, 1])
+            c1.success("Logged in as admin")
+            if c2.button("Log out"):
+                ss.is_admin = False
+                ss.pop("confirm_photo", None)
+                st.rerun()
+            if ss.get("admin_msg"):
+                st.success(ss.pop("admin_msg"))
+
+            st.markdown("### Photos")
+            counts = location_counts()
+            flt = st.selectbox("Filter by location", ["All locations"] +
+                               [f"{c['name']} (#{c['id']})" for c in counts], key="admin_filter")
+            flt_id = None if flt == "All locations" else int(flt.rsplit("#", 1)[1].rstrip(")"))
+            photos = admin_photos(flt_id)
+            if not photos:
+                st.info("No photos to show.")
+            for p in photos:
+                with st.container(border=True):
+                    c_img, c_info, c_act = st.columns([1, 3, 1])
+                    path = IMG_DIR / Path(p["filename"]).name
+                    if path.exists():
+                        c_img.image(str(path), width=120)
+                    c_info.markdown(f"**{p['name']}** · photo #{p['id']}")
+                    c_info.caption(f"{p['weather']} · {p['time_of_day']} · {p['season']} · "
+                                   f"by {p['submitted_by']} · {p['created_at']}")
+                    if ss.get("confirm_photo") == p["id"]:
+                        c_act.warning("Delete this photo?")
+                        if c_act.button("Yes, delete", key=f"yes_{p['id']}", type="primary"):
+                            delete_photo(p["id"])
+                            ss.pop("confirm_photo", None)
+                            ss.admin_msg = f"Deleted photo #{p['id']}."
+                            st.rerun()
+                        if c_act.button("Cancel", key=f"no_{p['id']}"):
+                            ss.pop("confirm_photo", None)
+                            st.rerun()
+                    elif c_act.button("Delete", key=f"del_{p['id']}"):
+                        ss.confirm_photo = p["id"]
+                        st.rerun()
+
+            st.markdown("### Delete a whole location")
+            st.caption("Removes the location and every photo submitted to it. "
+                       "Locations with 0 photos are hidden from search but still appear on the map.")
+            if counts:
+                n = ss.admin_nonce
+                target = st.selectbox("Location", counts, key=f"admin_loc_{n}",
+                                      format_func=lambda c: f"{c['name']} (#{c['id']}), {c['n']} photo(s)")
+                ok = st.checkbox(f"I understand this permanently deletes '{target['name']}' "
+                                 f"and its {target['n']} photo(s).", key=f"admin_ok_{n}")
+                if st.button("Delete location", disabled=not ok, key=f"admin_delloc_{n}"):
+                    removed = delete_location(target["id"])
+                    ss.admin_nonce += 1
+                    ss.admin_msg = f"Deleted '{target['name']}' and {removed} photo(s)."
+                    st.rerun()
