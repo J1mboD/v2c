@@ -480,7 +480,7 @@ def map_picker(name, marker_color, marker_icon, existing=(), key_suffix="", heig
 
 
 # ---------- UI ----------
-st.set_page_config(page_title="PhotoSpots", page_icon="📷", layout="wide")
+st.set_page_config(page_title="Views2Choose", page_icon="📷", layout="wide")
 init_db()
 for _n in ("origin", "submit"):
     picker_init(_n)
@@ -493,7 +493,7 @@ ss.setdefault("admin_fails", 0)
 ss.setdefault("admin_locked_until", 0.0)
 ss.setdefault("admin_nonce", 0)
 
-st.title("📷 PhotoSpots")
+st.title("📷 Views2Choose")
 st.caption("Find photography locations by the conditions you want to shoot in.")
 
 # The admin tab is not rendered for normal visitors. Open the app with ?admin in the URL to reveal it.
